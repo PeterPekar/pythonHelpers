@@ -9,10 +9,26 @@ from docx.text.paragraph import Paragraph as DocxParagraph # For type hinting
 
 # --- Configuration ---
 DEFAULT_HEADING_STYLE_PREFIX = "Heading"
-DEFAULT_CODE_STYLE_NAMES = ["Code", "CodeBlock", "SourceCode", "Courier", "CodeText"]
-DEFAULT_MONOSPACE_FONTS = ["Courier New", "Consolas", "Lucida Console", "Menlo", "Monaco", "Fixedsys"]
+DEFAULT_CODE_STYLE_NAMES = ["Code", "CodeBlock", "SourceCode", "Courier", "CodeText", "Fixed Normal"]
+DEFAULT_MONOSPACE_FONTS = ["Courier New", "Consolas", "Lucida Console", "Menlo", "Monaco", "Fixedsys", "Courier"]
 
-# --- Helper Functions for DOCX Element Processing (from Phase 1) ---
+MIN_CHUNK_SIZE_CHARS = 50 # Avoid tiny chunks from splitting
+DEFAULT_MAX_SECTION_CHARS = 4000
+DEFAULT_TARGET_CHUNK_CHARS = 1000
+DEFAULT_CHUNK_OVERLAP_CHARS = 100
+DEFAULT_SPLIT_SEPARATORS = [
+    "\n\n\n",  # Triple newlines
+    "\n\n",    # Double newlines (paragraph breaks)
+    "\n",      # Single newlines
+    ". ",      # Sentence breaks (with space after dot)
+    "? ",
+    "! ",
+    # ", ",    # Clause breaks - can be too aggressive
+    " ",       # Word breaks
+    ""         # Character breaks (last resort)
+]
+
+# --- Helper Functions for DOCX Element Processing ---
 
 def get_paragraph_text(p: DocxParagraph) -> str:
     """Extracts all text from a paragraph, stripping leading/trailing whitespace."""
@@ -24,7 +40,7 @@ def get_paragraph_heading_level(p: DocxParagraph, heading_style_prefix: str) -> 
     starts with heading_style_prefix followed by a number.
     Returns None if it's not a heading.
     """
-    if not p.style or not p.style.name: # Ensure style and style.name exist
+    if not p.style or not p.style.name:
         return None
 
     style_name = p.style.name
@@ -34,10 +50,10 @@ def get_paragraph_heading_level(p: DocxParagraph, heading_style_prefix: str) -> 
     if match:
         try:
             level = int(match.group(1))
-            if 1 <= level <= 9: # DOCX supports up to 9 heading levels
+            if 1 <= level <= 9:
                 return level
         except ValueError:
-            return None # Should not happen if regex matches \d+
+            return None
     return None
 
 def is_paragraph_code(p: DocxParagraph, code_style_names: list[str], monospace_fonts: list[str]) -> bool:
@@ -52,21 +68,22 @@ def is_paragraph_code(p: DocxParagraph, code_style_names: list[str], monospace_f
 
     if p.runs:
         has_text_in_runs = any(run.text.strip() for run in p.runs)
-        if not has_text_in_runs and not p.text.strip(): # Empty paragraph
-            return False
-        if not has_text_in_runs and p.text.strip(): # Paragraph has text but not in runs? Unlikely.
-             return False
-
+        if not has_text_in_runs and not p.text.strip():
+            return False # Empty paragraph
+        if not has_text_in_runs and p.text.strip():
+             return False # Text exists but not in runs (unlikely for typical docx)
 
         non_empty_runs_are_monospace = True
         text_present_in_paragraph = False
         for run in p.runs:
-            if run.text.strip(): # Only consider runs with actual text
+            if run.text.strip():
                 text_present_in_paragraph = True
-                if not (run.font and run.font.name and any(mf.lower() == run.font.name.lower() for mf in monospace_fonts)):
+                # Check if font name exists and is in the monospace list
+                font_name = run.font.name
+                if not (font_name and any(mf.lower() == font_name.lower() for mf in monospace_fonts)):
                     non_empty_runs_are_monospace = False
                     break
-        if text_present_in_paragraph and non_empty_runs_are_monospace: # Ensure there was text to check font for
+        if text_present_in_paragraph and non_empty_runs_are_monospace:
             return True
 
     return False
@@ -88,153 +105,194 @@ def get_table_text(table: DocxTable, code_style_names: list[str], monospace_font
                         cell_content_parts.append(f"[CODE BLOCK START]\n{p_text}\n[CODE BLOCK END]")
                     else:
                         cell_content_parts.append(p_text)
-            row_text_parts.append(" ".join(cell_content_parts).strip())
+            row_text_parts.append(" ".join(cell_content_parts).strip()) # Join paragraphs in cell with space
 
-        if any(rtp for rtp in row_text_parts):
+        if any(rtp for rtp in row_text_parts): # Only add row if it has content
             table_text_parts.append(" | ".join(row_text_parts))
 
-    if len(table_text_parts) > 1:
+    if len(table_text_parts) > 1: # Has at least one row of content
         table_text_parts.append("[TABLE END]")
         return "\n".join(table_text_parts)
-    return ""
+    return "" # Return empty if table (other than marker) is empty
 
 
-# --- Phase 2: Heading-Based Section Aggregation --- (Content moved to the final integrated script)
-# generate_sections_from_docx and its helpers are now part of the complete script below.
+# --- Heading-Based Section Aggregation (Phase 2 core) ---
+
+def generate_sections_from_docx(doc_path: str, heading_style_prefix: str,
+                                code_style_names: list[str], monospace_fonts: list[str],
+                                doc_filename: str):
+    """
+    Generates preliminary sections based on heading structure.
+    Each section includes its aggregated content and heading hierarchy.
+    """
+    print(f"--- Generating sections from document: {doc_path} ---")
+    sections = []
+    try:
+        document: DocxDocument = Document(doc_path)
+    except Exception as e:
+        print(f"Error opening or parsing DOCX file '{doc_path}': {e}")
+        return []
+
+    current_heading_trail = []  # List of tuples: (level, text)
+    current_section_content_parts = []
+
+    def finalize_current_section():
+        nonlocal current_section_content_parts, current_heading_trail
+        if not current_section_content_parts:
+            return
+
+        raw_content = "\n\n".join(filter(None, current_section_content_parts)).strip()
+        if raw_content:
+            frozen_heading_trail = list(current_heading_trail)
+            metadata = {
+                "source_filename": doc_filename,
+                "heading_hierarchy": [h[1] for h in frozen_heading_trail]
+            }
+            sections.append({
+                "raw_content": raw_content,
+                "metadata": metadata
+            })
+        current_section_content_parts = []
 
 
-# --- Phase 3: Recursive Character Splitting and Final Output ---
+    for element_idx, element in enumerate(document.element.body):
+        element_text_representation = ""
 
-DEFAULT_MAX_SECTION_CHARS = 4000
-DEFAULT_TARGET_CHUNK_CHARS = 1000
-DEFAULT_CHUNK_OVERLAP_CHARS = 100
-DEFAULT_SPLIT_SEPARATORS = [
-    "\n\n\n",  # Triple newlines (often separate very distinct blocks)
-    "\n\n",    # Double newlines (paragraph breaks)
-    "\n",      # Single newlines
-    ". ",      # Sentence breaks (with space)
-    "? ",
-    "! ",
-    # ", ",      # Clause breaks - can be too aggressive
-    " ",       # Word breaks
-    ""         # Character breaks (last resort)
-]
-MIN_CHUNK_SIZE_CHARS = 50 # Avoid tiny chunks from splitting
+        if element.tag.endswith('p'):
+            para = DocxParagraph(element, document)
+            text = get_paragraph_text(para)
+
+            if not text and not any(run.element.xpath('.//w:drawing') or run.element.xpath('.//w:pict') for run in para.runs):
+                continue # Skip empty paragraphs unless they contain images/drawings
+
+            heading_level = get_paragraph_heading_level(para, heading_style_prefix)
+
+            if heading_level is not None:
+                finalize_current_section()
+                current_heading_trail = [h for h in current_heading_trail if h[0] < heading_level]
+                current_heading_trail.append((heading_level, text))
+                element_text_representation = text
+            else:
+                if is_paragraph_code(para, code_style_names, monospace_fonts):
+                    element_text_representation = f"[CODE BLOCK START]\n{text}\n[CODE BLOCK END]"
+                else:
+                    element_text_representation = text
+
+        elif element.tag.endswith('tbl'):
+            table = DocxTable(element, document)
+            table_text = get_table_text(table, code_style_names, monospace_fonts)
+            if table_text:
+                element_text_representation = table_text
+
+        if element_text_representation:
+            current_section_content_parts.append(element_text_representation)
+
+    finalize_current_section()
+
+    print(f"--- Generated {len(sections)} initial sections from {doc_filename} ---")
+    return sections
+
+# --- Recursive Character Splitting and Final Output (Phase 3 core) ---
 
 def recursive_character_split(text: str, separators: list[str],
                               target_size: int, overlap_size: int
                               ) -> list[str]:
     """
     Recursively splits text into chunks aiming for target_size.
-    Inspired by LangChain's RecursiveCharacterTextSplitter.
     """
     final_chunks = []
+    if not text.strip(): return []
 
-    if not text.strip(): # Handle empty or whitespace-only text
-        return []
-
-    if len(text) <= target_size and len(text) >= MIN_CHUNK_SIZE_CHARS:
-        final_chunks.append(text)
-        return final_chunks
-    elif len(text) < MIN_CHUNK_SIZE_CHARS: # Too small to be a meaningful chunk alone
-        # This case should ideally be handled by the caller by merging small prior/post chunks
-        # For now, if it's the only thing, return it if not empty.
-        if text.strip():
-             final_chunks.append(text)
+    if len(text) <= target_size:
+        if len(text) >= MIN_CHUNK_SIZE_CHARS: final_chunks.append(text)
+        elif text.strip(): final_chunks.append(text) # Keep very short if it's the only content
         return final_chunks
 
-
-    current_separator = ""
-    effective_separator_for_split = "" # Store the actual separator used for splitting
+    current_separator_for_splitting = ""
     for sep in separators:
-        if sep == "": # Use empty string as last resort
-            current_separator = sep
-            effective_separator_for_split = sep # No actual character to split by, implies fixed length
+        if sep == "": # Last resort
+            current_separator_for_splitting = sep
             break
         if sep in text:
-            current_separator = sep
-            effective_separator_for_split = sep
+            current_separator_for_splitting = sep
             break
-    else: # If no separator found in text (except possibly ""), use ""
-        current_separator = ""
-        effective_separator_for_split = ""
+    else: # No separator found, should use ""
+        current_separator_for_splitting = ""
 
-
-    # Logic for splitting based on chosen separator
-    if effective_separator_for_split != "":
-        splits = text.split(effective_separator_for_split)
-    else: # Forced character split if no other separator worked or was chosen
-        # If splitting by char, chunk_step should account for overlap to avoid re-generating same chunk
+    if current_separator_for_splitting == "": # Base case: split by length if no separators work
         chunk_step = target_size - overlap_size
-        if chunk_step <=0: chunk_step = target_size # avoid issues if overlap is too large
+        if chunk_step <= 0: chunk_step = max(1, target_size // 2) # Ensure step is positive
 
         for i in range(0, len(text), chunk_step):
             chunk = text[i:i + target_size]
             if len(chunk.strip()) >= MIN_CHUNK_SIZE_CHARS:
                 final_chunks.append(chunk)
-        return final_chunks # Character split is the final strategy, no further recursion on these parts
+            elif i == 0 and chunk.strip(): # if it's the first and only chunk and very small
+                final_chunks.append(chunk)
+        return final_chunks
 
-    # Process splits from a found separator
-    current_doc_buffer = ""
-    for i, s_part in enumerate(splits):
-        part_to_add = s_part
-        # Add back the separator if this is not the first part after a split by a non-empty separator
-        if i > 0 and effective_separator_for_split:
-            part_to_add = effective_separator_for_split + s_part
+    # Split by the chosen separator
+    splits = text.split(current_separator_for_splitting)
 
-        if len(current_doc_buffer) + len(part_to_add) <= target_size:
-            current_doc_buffer += part_to_add
+    good_chunks_from_this_level = []
+    buffer = ""
+    for i, part in enumerate(splits):
+        # Add back separator if it's not the first part and separator is not empty
+        part_to_add_to_buffer = (current_separator_for_splitting + part) if (i > 0 and current_separator_for_splitting) else part
+
+        if len(buffer) + len(part_to_add_to_buffer) <= target_size:
+            buffer += part_to_add_to_buffer
         else:
-            # Finalize current buffer if it's meaningful
-            if len(current_doc_buffer.strip()) >= MIN_CHUNK_SIZE_CHARS:
-                final_chunks.append(current_doc_buffer)
+            # Finalize buffer if it's meaningful
+            if len(buffer.strip()) >= MIN_CHUNK_SIZE_CHARS:
+                good_chunks_from_this_level.append(buffer)
 
-            # Start new buffer with current part; if it's too large, it will be recursed upon
-            current_doc_buffer = s_part # Store the part *without* the leading separator for now
-                                        # as it might be the start of a new large chunk to be split
+            # Start new buffer. If part_to_add_to_buffer itself is too large, it'll be handled by recursion.
+            # If part_to_add_to_buffer is small, it starts the new buffer.
+            buffer = part # Start new buffer with the current part (without leading separator initially)
+                         # If this part is also too large, recursion will handle it.
+                         # If the part itself is small, it's the start of a new chunk.
 
     # Add any remaining content in buffer
-    if len(current_doc_buffer.strip()) >= MIN_CHUNK_SIZE_CHARS:
-        final_chunks.append(current_doc_buffer)
+    if len(buffer.strip()) >= MIN_CHUNK_SIZE_CHARS:
+        good_chunks_from_this_level.append(buffer)
+    elif not good_chunks_from_this_level and buffer.strip(): # If it's the only piece and small
+        good_chunks_from_this_level.append(buffer)
 
-    # Post-process the chunks: recurse on any that are still too large, apply overlap
-    processed_chunks = []
-    for chunk in final_chunks:
+
+    # Recursively process any chunks from this level that are still too large
+    for chunk in good_chunks_from_this_level:
         if len(chunk) > target_size:
-            # Determine next set of separators for recursion
+            # Find the index of the current separator to pass the rest for recursion
             next_separators = separators
-            if current_separator != "": # If we used a specific separator
-                try:
-                    sep_idx = separators.index(current_separator)
-                    next_separators = separators[sep_idx + 1:] # Try next ones
-                    if not next_separators : next_separators = [""] # Must have at least char split
-                except ValueError: # Should not happen if current_separator was from separators
-                    next_separators = [""]
+            try:
+                idx_sep = separators.index(current_separator_for_splitting)
+                if idx_sep < len(separators) -1 :
+                     next_separators = separators[idx_sep+1:]
+                else: # No more separators, next recursion must use length based split
+                     next_separators = [""]
+            except ValueError: # current_separator_for_splitting was ""
+                next_separators = [""] # Force length-based split
 
-            processed_chunks.extend(recursive_character_split(chunk, next_separators, target_size, overlap_size))
-        elif len(chunk.strip()) >= MIN_CHUNK_SIZE_CHARS: # Ensure chunk is not just whitespace
-            processed_chunks.append(chunk)
+            final_chunks.extend(recursive_character_split(chunk, next_separators, target_size, overlap_size))
+        elif len(chunk.strip()) >= MIN_CHUNK_SIZE_CHARS:
+            final_chunks.append(chunk)
+        elif not final_chunks and chunk.strip(): # Keep if it's the only result and has content
+             final_chunks.append(chunk)
 
-    final_chunks = processed_chunks
-
-    # Apply overlap
+    # Apply overlap (simplified)
     if overlap_size > 0 and len(final_chunks) > 1:
         overlapped_chunks = [final_chunks[0]]
         for i in range(1, len(final_chunks)):
-            # Get overlap from the previous *original* chunk (before it might have been re-chunked due to its own overlap)
-            # This is tricky. For simplicity, let's take from the immediate previous in current final_chunks.
             overlap_text = final_chunks[i-1][-overlap_size:]
             current_chunk_text = final_chunks[i]
-
-            # Avoid prepending overlap if it's already the start of the current chunk
-            if not current_chunk_text.startswith(overlap_text):
-                 overlapped_chunks.append(overlap_text + current_chunk_text)
+            if not current_chunk_text.startswith(overlap_text): # Avoid duplicating overlap
+                overlapped_chunks.append(overlap_text + current_chunk_text)
             else:
-                 overlapped_chunks.append(current_chunk_text) # Already contains overlap
+                overlapped_chunks.append(current_chunk_text)
+        return [c for c in overlapped_chunks if c.strip()] # Ensure no empty strings after overlap
 
-        return [c for c in overlapped_chunks if len(c.strip()) >= MIN_CHUNK_SIZE_CHARS] # Filter out tiny chunks again
-
-    return [c for c in final_chunks if len(c.strip()) >= MIN_CHUNK_SIZE_CHARS]
+    return [c for c in final_chunks if c.strip()]
 
 
 def create_final_chunks(sections: list[dict], max_section_chars: int,
@@ -250,23 +308,24 @@ def create_final_chunks(sections: list[dict], max_section_chars: int,
         section_content = section["raw_content"]
         section_metadata = section["metadata"]
 
-        # print(f"\nProcessing section {section_idx+1} (len: {len(section_content)} chars) under: {' > '.join(section_metadata['heading_hierarchy'] if section_metadata['heading_hierarchy'] else ['(No Heading)']) }")
+        sub_chunks = []
+        if not section_content.strip(): # Skip empty sections
+            continue
 
-        if len(section_content) > max_section_chars and max_section_chars > 0 : # max_section_chars = 0 means no secondary split
-            # print(f"  Section needs splitting (current size: {len(section_content)}, max: {max_section_chars}). Target chunk: {target_chunk_chars}")
+        if max_section_chars > 0 and len(section_content) > max_section_chars :
+            # print(f"  Section {section_idx+1} needs splitting (len: {len(section_content)}). Target: {target_chunk_chars}")
             sub_chunks = recursive_character_split(
                 section_content,
                 split_separators,
                 target_chunk_chars,
                 chunk_overlap_chars
             )
-            # print(f"  Split into {len(sub_chunks)} sub-chunks.")
         else:
-            sub_chunks = [section_content] if section_content.strip() else []
+            sub_chunks = [section_content]
 
         for content_piece in sub_chunks:
             stripped_content = content_piece.strip()
-            if not stripped_content: # Skip empty or whitespace-only chunks
+            if not stripped_content:
                 continue
 
             doc_chunk_id_counter += 1
@@ -299,7 +358,7 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_overlap_chars", type=int, default=DEFAULT_CHUNK_OVERLAP_CHARS,
                         help=f"Char overlap for recursively split chunks (default: {DEFAULT_CHUNK_OVERLAP_CHARS})")
     parser.add_argument("--split_separators", default="|".join(DEFAULT_SPLIT_SEPARATORS).replace("\n","\\n"),
-                        help="Pipe-separated list of separators for recursive splitting, e.g. '\\n\\n|\\n|.'")
+                        help="Pipe-separated list of separators for recursive splitting, e.g. '\\n\\n\\n|\\n\\n|\\n|. | |'")
 
 
     args = parser.parse_args()
@@ -307,13 +366,13 @@ if __name__ == "__main__":
     code_style_names_list = [s.strip().lower() for s in args.code_styles.split(',')]
     monospace_fonts_list = [f.strip().lower() for f in args.mono_fonts.split(',')]
 
-    parsed_separators = [sep.replace("\\n", "\n") for sep in args.split_separators.split('|')]
+    custom_separators_str = args.split_separators.split('|')
+    parsed_separators = [s.replace("\\n", "\n") for s in custom_separators_str]
 
 
     if os.path.exists(args.input_file):
         doc_filename = os.path.basename(args.input_file)
 
-        # Phase 2 logic is now part of generate_sections_from_docx, called from main
         generated_sections = generate_sections_from_docx(
             args.input_file,
             args.heading_prefix,
@@ -341,10 +400,11 @@ if __name__ == "__main__":
 
                 print(f"\n\n--- Preview of Final Chunks (Max 2) ---")
                 for i, chunk_data in enumerate(final_chunks[:2]):
-                    print(f"\nChunk {i+1}:")
-                    print(f"  Metadata: {chunk_data['metadata']}")
-                    print(f"  Content Preview (first 150 chars): {chunk_data['content'][:150]}...")
-                    print(f"  Content Length: {len(chunk_data['content'])}")
+                    if i < 2 : # Print only first 2
+                        print(f"\nChunk {chunk_data['metadata']['doc_chunk_id']}:")
+                        print(f"  Metadata: {chunk_data['metadata']}")
+                        print(f"  Content Preview (first 150 chars): {chunk_data['content'][:150]}...")
+                        print(f"  Content Length: {len(chunk_data['content'])}")
             else:
                 print("No final chunks were generated after splitting.")
         else:
