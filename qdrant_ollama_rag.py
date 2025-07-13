@@ -114,7 +114,6 @@ def search_qdrant(client: QdrantClient, collection_name: str, query_vector: List
 def format_context_from_results(results: List[ScoredPoint], max_context_chars: int = 7000) -> str:
     if not results: return "No relevant context found in the knowledge base."
     context_parts = []; current_chars = 0
-    # print(f"INFO: Formatting context from {len(results)} retrieved chunks...") # Can be verbose
     for i, hit in enumerate(results):
         payload = cast(Dict[str, Any], hit.payload if hit.payload else {})
         content = payload.get("text_content", "").strip()
@@ -122,14 +121,38 @@ def format_context_from_results(results: List[ScoredPoint], max_context_chars: i
         source_file = metadata.get("source_filename", "Unknown Source")
         headings = cast(List[str], metadata.get("heading_hierarchy", []))
 
+        is_code = metadata.get("is_code_block", False)
+        is_table = metadata.get("is_table_row", False)
+        is_list_item = metadata.get("is_list", False)
+
         entry_header = f"Context from Document: '{source_file}'"
         if headings: entry_header += f"\nSection: \"{' > '.join(headings)}\""
 
-        entry_len = len(entry_header) + len(content) + 50 # Approx length with formatting
+        content_type = "Text"
+        if is_code:
+            content_type = "Code Block"
+        elif is_table:
+            content_type = "Table Row"
+        elif is_list_item:
+            content_type = "List"
+
+        entry_header += f"\nType: {content_type}"
+
+        formatted_content = content
+        if is_code:
+            formatted_content = f"```\n{content}\n```"
+        elif is_table:
+            # Tables are already in Markdown format
+            pass
+
+        entry_len = len(entry_header) + len(formatted_content) + 50
         if max_context_chars > 0 and (current_chars + entry_len > max_context_chars) and context_parts:
             print(f"WARN: Max context length ({max_context_chars}) reached. Stopping at chunk {i+1}/{len(results)}.")
             break
-        context_parts.append(f"{entry_header}\nContent:\n{content}\n---"); current_chars += entry_len
+
+        context_parts.append(f"{entry_header}\nContent:\n{formatted_content}\n---")
+        current_chars += entry_len
+
     return "\n".join(context_parts) if context_parts else "No context formatted."
 
 def generate_with_ollama(ollama_host_url: str, ollama_model_name: str,
@@ -224,6 +247,9 @@ def main():
     rag_group = parser.add_argument_group('Retrieval and RAG Configuration')
     rag_group.add_argument("--top_k", type=int, default=DEFAULT_TOP_K, help="Number of chunks from Qdrant.")
     rag_group.add_argument("--filter_filename", default=None, help="Filter Qdrant by metadata.source_filename.")
+    rag_group.add_argument("--filter_is_code", action="store_true", help="Filter for code blocks.")
+    rag_group.add_argument("--filter_is_table", action="store_true", help="Filter for table rows.")
+    rag_group.add_argument("--filter_is_list", action="store_true", help="Filter for lists.")
     rag_group.add_argument("--max_context_chars", type=int, default=7000, help="Max context characters for Ollama (0 for no limit).")
 
     args = parser.parse_args()
@@ -252,13 +278,27 @@ def main():
 
         print("\nINFO: --- Retrieval Phase ---")
         query_vector = embed_query(model_instance, args.user_query)
-        q_filter = models.Filter(must=[models.FieldCondition(key="metadata.source_filename", match=models.MatchValue(value=args.filter_filename))]) if args.filter_filename else None
+
+        filters = []
+        if args.filter_filename:
+            filters.append(models.FieldCondition(key="metadata.source_filename", match=models.MatchValue(value=args.filter_filename)))
+        if args.filter_is_code:
+            filters.append(models.FieldCondition(key="metadata.is_code_block", match=models.MatchValue(value=True)))
+        if args.filter_is_table:
+            filters.append(models.FieldCondition(key="metadata.is_table_row", match=models.MatchValue(value=True)))
+        if args.filter_is_list:
+            filters.append(models.FieldCondition(key="metadata.is_list", match=models.MatchValue(value=True)))
+
+        q_filter = models.Filter(must=filters) if filters else None
+
         search_results = search_qdrant(q_client, args.qdrant_collection, query_vector, args.top_k, filter_conditions=q_filter, vector_name=args.vector_name)
 
         print("\nINFO: --- Augmentation & Generation Phase ---")
         context_str = format_context_from_results(search_results, args.max_context_chars)
         final_prompt = (
             f"You are a helpful assistant. Answer the user's query based on the provided context. "
+            f"The context below contains chunks of text from a technical document. Each chunk has a type (e.g., 'Text', 'Code Block', 'Table Row', 'List'). "
+            f"Pay attention to the type of each chunk to understand its content. For example, 'Code Block' contains source code, and 'Table Row' is a row from a larger table. "
             f"If the context does not adequately cover the query, state that the information is not found in the provided documents. "
             f"Be concise.\n\nCONTEXT:\n{context_str}\n\nUSER QUERY: {args.user_query}\n\nANSWER:")
 
