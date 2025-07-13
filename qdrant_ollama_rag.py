@@ -75,7 +75,6 @@ def init_qdrant_client(url: Optional[str] = None, api_key: Optional[str] = None,
         raise ValueError("Qdrant URL or path is required.")
     try:
         client = QdrantClient(**client_args)
-        client.health_check()
         print("INFO: Qdrant client initialized and connected.")
         return client
     except Exception as e:
@@ -254,6 +253,7 @@ def main():
         query_vector = embed_query(model_instance, args.user_query)
         q_filter = models.Filter(must=[models.FieldCondition(key="metadata.source_filename", match=models.MatchValue(value=args.filter_filename))]) if args.filter_filename else None
         search_results = search_qdrant(q_client, args.qdrant_collection, query_vector, args.top_k, filter_conditions=q_filter, vector_name=args.vector_name)
+        print(f"INFO: Retrieved {search_results} chunks from Qdrant.")
 
         print("\nINFO: --- Augmentation & Generation Phase ---")
         context_str = format_context_from_results(search_results, args.max_context_chars)

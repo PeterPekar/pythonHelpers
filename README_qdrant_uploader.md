@@ -28,9 +28,7 @@ This Python script loads text chunks and their associated metadata from a JSON f
 If you don't have a Qdrant instance running, the easiest way to get started for local testing is using Docker:
 
 ```bash
-docker run -p 6333:6333 -p 6334:6334 \
-    -v $(pwd)/qdrant_storage:/qdrant/storage \
-    qdrant/qdrant
+docker run -p 6333:6333 -p 6334:6334 -v /qdrant_storage:/qdrant/storage qdrant/qdrant
 ```
 
 *   This command starts a Qdrant instance.
