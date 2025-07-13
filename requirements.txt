@@ -1,0 +1,4 @@
+spacy
+python-docx
+transformers
+torch
