@@ -94,32 +94,20 @@ def ingest_document(docx_path):
     return windows_and_chunks
 
 if __name__ == "__main__":
-    # Create a dummy docx for testing
-    doc = Document()
-    doc.add_heading('This is a title', 0)
-    p = doc.add_paragraph('A plain paragraph having some ')
-    p.add_run('bold').bold = True
-    p.add_run(' and some ')
-    p.add_run('italic.').italic = True
-
-    doc.add_heading('This is a heading', level=1)
-    doc.add_paragraph('Intense quote', style='Intense Quote')
-
-    doc.add_paragraph(
-        'first item in unordered list', style='List Bullet'
-    )
-    doc.add_paragraph(
-        'first item in ordered list', style='List Number'
-    )
-    file_path = "sample_document.docx"
-    doc.save(file_path)
-
-    # Ingest the document
-    pipeline_output = ingest_document(file_path)
-
-    # Print the output
+    import argparse
     import json
-    print(json.dumps(pipeline_output, indent=2))
 
-    # Clean up the dummy file
-    os.remove(file_path)
+    parser = argparse.ArgumentParser(description="Ingest a .docx file and process it into structured data.")
+    parser.add_argument("file_path", help="The path to the .docx file to ingest.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.file_path):
+        print(f"Error: File not found at {args.file_path}")
+    elif not args.file_path.lower().endswith('.docx'):
+        print(f"Error: File is not a .docx file: {args.file_path}")
+    else:
+        # Ingest the document
+        pipeline_output = ingest_document(args.file_path)
+
+        # Print the output
+        print(json.dumps(pipeline_output, indent=2))

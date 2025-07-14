@@ -352,6 +352,7 @@ def create_final_chunks(sections: list[dict], max_section_chars: int,
     Ensures that all chunks are at least MIN_CHUNK_SIZE_CHARS long.
     """
     all_chunks = []
+    final_chunks_with_metadata = []
     doc_chunk_id_counter = 0
 
     for section in sections:
