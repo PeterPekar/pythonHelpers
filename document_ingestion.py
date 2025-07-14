@@ -236,67 +236,75 @@ def ensure_collection(client: QdrantClient, collection_name: str,
             raise
 
 # --- Phase 2 Functions ---
-def process_and_upsert_chunks(client: QdrantClient, collection_name: str,
-                              embedding_model: SentenceTransformer,
-                              chunks: List[Dict[str, Any]],
-                              batch_size: int,
-                              id_field: Optional[str] = None,
-                              vector_name: Optional[str] = None):
-    """Generates embeddings for chunks and upserts them to Qdrant in batches."""
-    total_chunks = len(chunks)
+def process_and_upsert_windows_and_chunks(
+    client: QdrantClient,
+    windows_collection_name: str,
+    chunks_collection_name: str,
+    embedding_model: SentenceTransformer,
+    windows_and_chunks: List[Dict[str, Any]],
+    batch_size: int,
+    vector_name: Optional[str] = None
+):
+    """
+    Processes windows and chunks, embeds them, and upserts them to their respective collections.
+    """
+    # Upsert Windows
+    window_points = []
+    for window in windows_and_chunks:
+        window_id = str(uuid.uuid4())
+        window['id'] = window_id  # Assign ID for later reference
+        
+        # Windows are not embedded, so we create points without vectors
+        point = PointStruct(
+            id=window_id,
+            payload={
+                "heading": window["heading"],
+                "content": window["content"]
+            }
+        )
+        window_points.append(point)
+
+    if window_points:
+        print(f"Upserting {len(window_points)} windows to collection '{windows_collection_name}'...")
+        client.upsert(collection_name=windows_collection_name, points=window_points, wait=True)
+
+    # Upsert Chunks
+    all_chunks = []
+    for window in windows_and_chunks:
+        for chunk in window["chunks"]:
+            chunk['parent_window_id'] = window['id']
+            all_chunks.append(chunk)
+
+    total_chunks = len(all_chunks)
     if total_chunks == 0:
         print("No chunks to process.")
         return
 
-    print(f"Starting processing and upserting of {total_chunks} chunks to collection '{collection_name}'...")
+    print(f"Starting processing and upserting of {total_chunks} chunks to collection '{chunks_collection_name}'...")
 
     for i in range(0, total_chunks, batch_size):
-        batch_chunks = chunks[i:i + batch_size]
-        batch_number = i // batch_size + 1
-        total_batches = (total_chunks + batch_size - 1) // batch_size
-        print(f"  Processing batch {batch_number}/{total_batches} (chunks {i+1}-{min(i+batch_size, total_chunks)})...")
-
+        batch_chunks = all_chunks[i:i + batch_size]
         texts_to_embed = [chunk["content"] for chunk in batch_chunks]
-        try:
-            embeddings = embedding_model.encode(texts_to_embed, show_progress_bar=False)
-        except Exception as e:
-            print(f"Error generating embeddings for batch {batch_number}: {e}")
-            print(f"Skipping this batch due to embedding error.")
-            continue
+        embeddings = embedding_model.encode(texts_to_embed, show_progress_bar=False)
 
-        batch_points: List[PointStruct] = []
-        for chunk_idx, chunk_data in enumerate(batch_chunks):
-            point_id_val: str
-            # Ensure metadata is a dict before trying to access id_field
-            metadata_dict = chunk_data.get("metadata", {}) if isinstance(chunk_data.get("metadata"), dict) else {}
-
-            if id_field and id_field in metadata_dict:
-                point_id_val = str(metadata_dict[id_field])
-            else:
-                point_id_val = str(uuid.uuid4())
-
+        chunk_points = []
+        for chunk_data, embedding in zip(batch_chunks, embeddings):
+            point_id = str(uuid.uuid4())
+            
+            # Add parent_window_id to the chunk's payload
             payload = {
                 "text_content": chunk_data["content"],
-                "metadata": metadata_dict # Use the (potentially empty) metadata_dict
+                "metadata": chunk_data["metadata"],
+                "parent_window_id": chunk_data['parent_window_id']
             }
 
-            vector_input: models.VectorStruct | Dict[str, List[float]]
-            current_embedding = embeddings[chunk_idx].tolist()
-            if vector_name:
-                vector_input = {vector_name: current_embedding}
-            else:
-                vector_input = current_embedding
+            vector_input = {vector_name: embedding.tolist()} if vector_name else embedding.tolist()
+            chunk_points.append(PointStruct(id=point_id, vector=vector_input, payload=payload))
 
-            batch_points.append(PointStruct(id=point_id_val, vector=vector_input, payload=payload)) # type: ignore
+        if chunk_points:
+            client.upsert(collection_name=chunks_collection_name, points=chunk_points, wait=True)
 
-        if batch_points:
-            try:
-                client.upsert(collection_name=collection_name, points=batch_points, wait=True)
-            except Exception as e:
-                print(f"Error upserting batch {batch_number} to Qdrant: {e}")
-                print(f"Skipping this batch due to upsert error.")
-
-    print(f"Finished processing and upserting all chunks.")
+    print("Finished processing and upserting all windows and chunks.")
 
 if __name__ == "__main__":
     import argparse
@@ -304,7 +312,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Ingest a .docx file and process it into structured data.")
     parser.add_argument("file_path", help="The path to the .docx file to ingest.")
-    parser.add_argument("collection_name", help="Name of the Qdrant collection.")
+    parser.add_argument("chunks_collection_name", help="Name of the Qdrant collection for chunks.")
+    parser.add_argument("windows_collection_name", help="Name of the Qdrant collection for windows.")
 
     q_group = parser.add_argument_group('Qdrant Connection')
     q_conn_type = q_group.add_mutually_exclusive_group()
@@ -345,15 +354,10 @@ if __name__ == "__main__":
     elif not args.file_path.lower().endswith('.docx'):
         print(f"Error: File is not a .docx file: {args.file_path}")
     else:
-        # Ingest the document
         windows_and_chunks = ingest_document(args.file_path)
         
-        all_chunks = []
-        for window in windows_and_chunks:
-            all_chunks.extend(window['chunks'])
-        
-        if not all_chunks:
-            print("No chunks were generated from the document. Exiting.")
+        if not windows_and_chunks:
+            print("No windows or chunks were generated from the document. Exiting.")
         else:
             print("--- Initializing ---")
             embedding_model_instance: Optional[SentenceTransformer] = None
@@ -362,7 +366,7 @@ if __name__ == "__main__":
             try:
                 embedding_model_instance = load_embedding_model(args.embedding_model)
                 vector_dimension = get_embedding_dimension(embedding_model_instance)
-                print(f"Determined vector dimension: {vector_dimension} for model '{args.embedding_model}'")
+                print(f"Determd vector dimension: {vector_dimension} for model '{args.embedding_model}'")
 
                 qdrant_client_instance = init_qdrant_client(
                     url=qdrant_url_to_use if not args.qdrant_path else None,
@@ -372,22 +376,30 @@ if __name__ == "__main__":
                     timeout_seconds=args.qdrant_timeout
                 )
 
+                # Ensure both collections exist
                 ensure_collection(
                     qdrant_client_instance,
-                    args.collection_name,
+                    args.windows_collection_name,
+                    vector_size=vector_dimension,  # Or a different size if windows are embedded
+                    distance_metric_str=args.distance_metric,
+                    vector_name=args.vector_name
+                )
+                ensure_collection(
+                    qdrant_client_instance,
+                    args.chunks_collection_name,
                     vector_dimension,
                     args.distance_metric,
                     args.vector_name
                 )
 
-                print("\n--- Starting Chunk Processing and Upserting to Qdrant ---")
-                process_and_upsert_chunks(
+                print("\n--- Starting Window and Chunk Processing and Upserting to Qdrant ---")
+                process_and_upsert_windows_and_chunks(
                     qdrant_client_instance,
-                    args.collection_name,
+                    args.windows_collection_name,
+                    args.chunks_collection_name,
                     embedding_model_instance,
-                    all_chunks,
+                    windows_and_chunks,
                     args.batch_size,
-                    args.id_field,
                     args.vector_name
                 )
 

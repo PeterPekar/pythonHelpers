@@ -92,20 +92,37 @@ def search_qdrant(client: QdrantClient, collection_name: str, query_vector: List
         print(f"ERROR: Failed to search Qdrant: {e}")
         raise
 
-def format_context_from_results(results: List[ScoredPoint]) -> str:
-    if not results: return "No relevant context found in the knowledge base."
-    context_parts = []
-    for i, hit in enumerate(results):
-        payload = cast(Dict[str, Any], hit.payload if hit.payload else {})
-        content = payload.get("text_content", "").strip()
-        print(f"Content: {content} ")
-        metadata = cast(Dict[str, Any], payload.get("metadata", {}))
-        heading = metadata.get("section_heading", "N/A")
-        print(f"Heading: {heading} ")
+def retrieve_windows_from_chunks(client: QdrantClient, windows_collection_name: str, chunk_results: List[ScoredPoint]) -> List[Dict[str, Any]]:
+    """
+    Retrieves the parent windows for a list of chunk search results.
+    """
+    window_ids = [chunk.payload['parent_window_id'] for chunk in chunk_results if chunk.payload and 'parent_window_id' in chunk.payload]
+    if not window_ids:
+        return []
 
+    # Use a set to get unique window IDs
+    unique_window_ids = list(set(window_ids))
+    
+    retrieved_windows = client.retrieve(
+        collection_name=windows_collection_name,
+        ids=unique_window_ids,
+        with_payload=True
+    )
+    
+    # Convert retrieved points to a list of dictionaries
+    return [window.payload for window in retrieved_windows]
+
+def format_context_from_windows(windows: List[Dict[str, Any]]) -> str:
+    if not windows:
+        return "No relevant context found in the knowledge base."
+    
+    context_parts = []
+    for window in windows:
+        heading = window.get("heading", "N/A")
+        content = window.get("content", "").strip()
         entry = f"Section: {heading}\nContent:\n{content}\n---"
         context_parts.append(entry)
-
+        
     return "\n".join(context_parts)
 
 def generate_with_ollama(ollama_host_url: str, ollama_model_name: str,
@@ -164,13 +181,14 @@ def generate_with_ollama(ollama_host_url: str, ollama_model_name: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Retrieve relevant chunks from Qdrant and generate a response using Ollama.",
+        description="Retrieve relevant chunks from Qdrant, fetch their parent windows, and generate a response using Ollama.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("user_query", help="The user's query string.")
 
     q_group = parser.add_argument_group('Qdrant Configuration')
-    q_group.add_argument("--qdrant_collection", default="chunks", help="Qdrant collection name.")
+    q_group.add_argument("--chunks_collection", default="chunks", help="Qdrant collection name for chunks.")
+    q_group.add_argument("--windows_collection", default="windows", help="Qdrant collection name for windows.")
     q_conn_type = q_group.add_mutually_exclusive_group()
     q_conn_type.add_argument("--qdrant_url", default=os.getenv("QDRANT_URL", DEFAULT_QDRANT_URL), help="Qdrant URL.")
     q_conn_type.add_argument("--qdrant_path", default=os.getenv("QDRANT_PATH"), help="Path to local Qdrant DB.")
@@ -195,7 +213,7 @@ def main():
     print("--- Configuration ---")
     print(f"User Query: {args.user_query[:100]}...")
     print(f"Ollama Model: {args.ollama_model}, Host: {args.ollama_host}, Streaming: {not args.no_stream}")
-    print(f"Qdrant Collection: {args.qdrant_collection}, Top K: {args.top_k}")
+    print(f"Chunks Collection: {args.chunks_collection}, Windows Collection: {args.windows_collection}, Top K: {args.top_k}")
     print("---------------------\n")
 
     model_instance = None
@@ -211,11 +229,15 @@ def main():
 
         print("\nINFO: --- Retrieval Phase ---")
         query_vector = embed_query(model_instance, args.user_query)
-
-        search_results = search_qdrant(q_client, args.qdrant_collection, query_vector, args.top_k, vector_name=args.vector_name)
+        
+        # Search for chunks
+        chunk_search_results = search_qdrant(q_client, args.chunks_collection, query_vector, args.top_k, vector_name=args.vector_name)
+        
+        # Retrieve parent windows
+        retrieved_windows = retrieve_windows_from_chunks(q_client, args.windows_collection, chunk_search_results)
 
         print("\nINFO: --- Augmentation & Generation Phase ---")
-        context_str = format_context_from_results(search_results)
+        context_str = format_context_from_windows(retrieved_windows)
         final_prompt = (
             f"You are a helpful assistant. Answer the user's query based on the provided context. "
             f"If the context does not adequately cover the query, state that the information is not found in the provided documents. "
