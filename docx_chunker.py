@@ -349,8 +349,9 @@ def create_final_chunks(sections: list[dict], max_section_chars: int,
     """
     Takes sections, applies semantic splitting if needed, and formats final chunks.
     Handles code blocks, tables, lists, entity extraction, and section summarization.
+    Ensures that all chunks are at least MIN_CHUNK_SIZE_CHARS long.
     """
-    final_chunks_with_metadata = []
+    all_chunks = []
     doc_chunk_id_counter = 0
 
     for section in sections:
@@ -363,7 +364,6 @@ def create_final_chunks(sections: list[dict], max_section_chars: int,
         if summarize_sections_enabled and len(section_content) > max_section_chars:
             section_metadata["summary"] = summarize_text(section_content, api_token)
 
-        # Split content by code blocks, table rows, and lists
         parts = re.split(r'(\[CODE_BLOCK_START\].*?\[CODE_BLOCK_END\]|\[TABLE_ROW_SPLIT\]|\[LIST_START\].*?\[LIST_END\])', section_content, flags=re.DOTALL)
 
         for part in parts:
