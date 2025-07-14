@@ -75,7 +75,6 @@ def init_qdrant_client(url: Optional[str] = None, api_key: Optional[str] = None,
         raise ValueError("Qdrant URL or path is required.")
     try:
         client = QdrantClient(**client_args)
-        client.health_check()
         print("INFO: Qdrant client initialized and connected.")
         return client
     except Exception as e:
@@ -106,6 +105,7 @@ def search_qdrant(client: QdrantClient, collection_name: str, query_vector: List
             with_payload=True, search_params=search_params
         )
         print(f"INFO: Found {len(results)} results from Qdrant.")
+
         return results
     except Exception as e:
         print(f"ERROR: Failed to search Qdrant: {e}")
@@ -117,6 +117,7 @@ def format_context_from_results(results: List[ScoredPoint], max_context_chars: i
     for i, hit in enumerate(results):
         payload = cast(Dict[str, Any], hit.payload if hit.payload else {})
         content = payload.get("text_content", "").strip()
+        print(f"Result: {content}")
         metadata = cast(Dict[str, Any], payload.get("metadata", {}))
         source_file = metadata.get("source_filename", "Unknown Source")
         headings = cast(List[str], metadata.get("heading_hierarchy", []))
