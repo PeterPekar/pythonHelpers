@@ -250,6 +250,8 @@ def process_and_upsert_windows_and_chunks(
     """
     # Upsert Windows
     window_points = []
+    embedding_dim = embedding_model.get_sentence_embedding_dimension()
+    dummy_vector = [0.0] * embedding_dim
     for window in windows_and_chunks:
         window_id = str(uuid.uuid4())
         window['id'] = window_id  # Assign ID for later reference
@@ -257,6 +259,7 @@ def process_and_upsert_windows_and_chunks(
         # Windows are not embedded, so we create points without vectors
         point = PointStruct(
             id=window_id,
+            vector=dummy_vector,
             payload={
                 "heading": window["heading"],
                 "content": window["content"]
