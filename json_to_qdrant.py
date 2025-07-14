@@ -68,7 +68,7 @@ def init_qdrant_client(url: Optional[str] = None,
 
     try:
         client = QdrantClient(**client_args)
-        
+        client.health_check()
         print("Qdrant client initialized and connected successfully.")
         return client
     except Exception as e:

@@ -9,7 +9,7 @@ from docx.text.paragraph import Paragraph as DocxParagraph # For type hinting
 
 # --- Configuration ---
 DEFAULT_HEADING_STYLE_PREFIX = "Heading"
-MIN_CHUNK_SIZE_CHARS = 50 # Avoid tiny chunks from splitting
+MIN_CHUNK_SIZE_CHARS = 800 # Avoid tiny chunks from splitting
 DEFAULT_MAX_SECTION_CHARS = 4000
 DEFAULT_TARGET_CHUNK_CHARS = 1000
 DEFAULT_CHUNK_OVERLAP_CHARS = 100
@@ -255,7 +255,7 @@ def split_text_into_chunks(text: str, target_chunk_size: int, overlap: int) -> l
 
         # If a paragraph is larger than the target size, split it further
         if len(para) > target_chunk_size:
-            if current_chunk:
+            if current_chunk and len(current_chunk) >= MIN_CHUNK_SIZE_CHARS:
                 chunks.append(current_chunk.strip())
 
             # Sentence splitting as a fallback
@@ -265,10 +265,10 @@ def split_text_into_chunks(text: str, target_chunk_size: int, overlap: int) -> l
                 if len(sentence_chunk) + len(sent) + 1 < target_chunk_size:
                     sentence_chunk += sent + " "
                 else:
-                    if sentence_chunk:
+                    if sentence_chunk and len(sentence_chunk) >= MIN_CHUNK_SIZE_CHARS:
                         chunks.append(sentence_chunk.strip())
                     sentence_chunk = sent + " "
-            if sentence_chunk:
+            if sentence_chunk and len(sentence_chunk) >= MIN_CHUNK_SIZE_CHARS:
                 chunks.append(sentence_chunk.strip())
             current_chunk = ""
 
@@ -278,11 +278,11 @@ def split_text_into_chunks(text: str, target_chunk_size: int, overlap: int) -> l
 
         # Otherwise, finalize the current chunk and start a new one
         else:
-            if current_chunk:
+            if current_chunk and len(current_chunk) >= MIN_CHUNK_SIZE_CHARS:
                 chunks.append(current_chunk.strip())
             current_chunk = para + "\n\n"
 
-    if current_chunk:
+    if current_chunk and len(current_chunk) >= MIN_CHUNK_SIZE_CHARS:
         chunks.append(current_chunk.strip())
 
     if overlap > 0 and len(chunks) > 1:
